@@ -1,0 +1,5 @@
+SmartCoach_Backend/myenv/
+*.log
+__pycache__/
+.vscode/
+.env
