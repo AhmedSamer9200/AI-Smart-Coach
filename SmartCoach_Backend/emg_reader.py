@@ -1,79 +1,86 @@
-# 3. ملف emg_reader.py (قراية العضلات من الـ ESP32)
-# وظيفة الملف ده إنه يشتغل كـ "وسيط" بين الهاردوير (ESP32) وبين السحابة (Neon DB).
-# بيقرأ إشارات العضلات عن طريق كابل الـ USB (Serial Communication) ويرميها لايف في الداتا بيز.
+# 5. ملف emg_reader.py (سحب إشارات العضلات الذكي)
+# التعديل: توجيه الداتا للسحابة مباشرة مع نظام Session Caching لتقليل الضغط على الداتا بيز وزيادة السرعة.
 
 import serial
 import time
-from db_manager import DatabaseManager
+from db_manager import DatabaseManager # 🔥 ربط الداتا بيز
 
-# 1. إعدادات الاتصال بالبوردة (ESP32)
-# لو هتشتغل على ويندوز ممكن تتغير لـ COM3 أو COM4، بس على لينكس بتبقى غالباً ttyUSB0
-SERIAL_PORT = '/dev/ttyUSB0'  
-BAUD_RATE = 115200 # سرعة نقل الداتا (لازم تكون نفس السرعة اللي مكتوبة في كود الـ Arduino)
+# إعدادات الاتصال بالهاردوير (ESP32)
+SERIAL_PORT = '/dev/ttyUSB0'   
+BAUD_RATE = 115200
 
-# 2. بنفتح اتصال بقاعدة البيانات السحابية
+# بنفتح الاتصال بالداتا بيز
 db = DatabaseManager()
 
-# 🔥 التعديل السحري الأخير: توحيد الـ Session ID
-# كده إشارة العضلة هتتسجل جوه نفس الجلسة بتاعة الكاميرا والنبض
-session_id = "smartcoach_live_session" 
-
-def read_emg_and_save():
-    print(f"🔄 بنحاول نتصل بالبوردة على {SERIAL_PORT}...")
+def record_smart_emg():
+    print(f"🔌 بنحاول نتصل بالبوردة على {SERIAL_PORT}...")
     try:
         # بنفتح بوابات الاتصال مع البوردة
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(1.5) # بنستنى ثانية ونص عشان البوردة تعمل Reset براحتها وتبقى جاهزة
-        ser.reset_input_buffer() # بننظف أي داتا قديمة كانت متعلقة في الكابل
+        time.sleep(1.5) # انتظار لحد ما البوردة تعمل ريستارت وتستقر
+        ser.reset_input_buffer()
         
-        # 3. التحكم الآلي في الهاردوير (State Machine)
-        # بنبعت أمر START للبوردة عشان تفتح "حنفية" الداتا. 
-        # (ده بيوفر استهلاك البوردة ومبيخليهاش تبعت داتا عمال على بطال)
-        print("🟢 بعتنا أمر START للـ ESP32")
+        print("▶️ بعتنا أمر START للـ ESP32")
         ser.write(b"START\n")
         
-        # الـ Loop ده بيفضل شغال يسحب الداتا طول ما السيستم قايم
+        # 🔥 متغيرات تنظيم الوقت والـ Caching
+        last_db_update = 0 
+        last_session_check = 0 
+        cached_session_id = None # بنخزن هنا الـ ID عشان منسألش الداتا بيز عمال على بطال
+        
         while True:
-            # لو في داتا جاية في السكة من الكابل
+            # لو في داتا جاية من البوردة
             if ser.in_waiting > 0:
-                # بنقرأ السطر، بنفك تشفيره (decode)، وبنشيل أي مسافات زيادة (strip)
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                try:
-                    # بنحول القراية لرقم عشري (Float)
-                    emg_val = float(line)
-                    print(f"⚡ إشارة العضلة: {emg_val:.2f}")
-                    
-                    # 4. بنرمي الداتا في السحابة
-                    # الفنكشن دي ذكية (Upsert) لو الجلسة موجودة بتحدثها، فالداتا بيز متضربش إيرور
-                    db.upsert_exercise_data(
-                        session_id=session_id,
-                        emg_val=emg_val
-                    )
-                    
-                    # بننظف الكابل تاني عشان نستقبل القراية اللي بعدها على نضافة
-                    ser.reset_input_buffer()
-                except ValueError:
-                    # لو القراية جات فيها حروف أو مشوهة (Noise)، بنتجاهلها ونكمل عادي
-                    pass
-
+                line = ser.readline().decode('utf-8',errors='ignore').strip()
+                
+                # نتأكد إنها داتا حقيقية مش خطوط فواصل
+                if not line.startswith("---"):
+                    try:
+                        emg_val = float(line)
+                        current_time = time.time()
+                        
+                        # 🚀 السحر المعماري الأول (Session Caching):
+                        # بدل ما نسأل الداتا بيز كل نص ثانية، هنسألها كل 5 ثواني بس ونسجل النتيجة عندنا
+                        if current_time - last_session_check > 5.0:
+                            active_session = db.get_active_session_tokens()
+                            if active_session:
+                                cached_session_id = active_session["session_id"]
+                            else:
+                                cached_session_id = None # لو مفيش حد بيتمرن بنفضي الذاكرة
+                            last_session_check = current_time
+                        
+                        # 🚀 السحر المعماري التاني (Throttling):
+                        # بنبعت الإشارة للسحابة كل 0.5 ثانية عشان منعملش اختناق للنت (Network Bottleneck)
+                        if current_time - last_db_update > 0.5:
+                            
+                            if cached_session_id:
+                                print(f"💪 إشارة العضلة -> {emg_val:.2f} (Session: {cached_session_id})")
+                                # بنرمي القراية في الداتا بيز في الجلسة المحفوظة
+                                db.upsert_exercise_data(session_id=cached_session_id, emg_val=emg_val)
+                            else:
+                                # لو مفيش جلسة، بنطبع الداتا بس ومش بنسجلها
+                                print(f"⏳ مفيش تمرينة شغالة دلوقتي.. العضلة ({emg_val:.2f}) مش هتتسجل.")
+                                
+                            last_db_update = current_time
+                            
+                        # بننظف الكابل عشان نستقبل القراية اللي بعدها بأعلى سرعة
+                        ser.reset_input_buffer()
+                    except ValueError:
+                        pass # لو البوردة بعتت كلام غريب بدل الأرقام يتجاهله
+                        
     except serial.SerialException as e:
-        # لو الكابل مش متوصل أو البورت غلط، السيستم مش بيكراش، بيطبعلك الإيرور بس
-        print(f"❌ مش قادرين نوصل للبورت: {e}")
+        print(f"❌ مش قادرين نوصل للبورت (تأكد إن الكابل متوصل): {e}")
     except KeyboardInterrupt:
-        # لو إنت دوست Ctrl+C عشان تقفل السيستم
         print("\n🛑 بنقفل السيستم...")
     finally:
-        # 5. خطوة الأمان الأخيرة (Graceful Shutdown)
-        # لو قفلنا السيستم، لازم نبعت أمر STOP للبوردة عشان تقفل الحنفية وتدخل تنام (Deep Sleep)
+        # 🔥 خطوة الأمان (Graceful Shutdown)
         if 'ser' in locals() and ser.is_open:
-            print("🔴 بنبعت أمر STOP للـ ESP32 عشان تنام")
+            print("⏸️ بنبعت أمر STOP للـ ESP32 عشان تنام (Deep Sleep)")
             ser.write(b"STOP\n")
-            time.sleep(0.1)
-            ser.close() # بنقفل بوابات الاتصال
-        
-        # بنقفل الاتصال بالداتا بيز عشان منستهلكش موارد السيرفر
+            time.sleep(0.1) 
+            ser.close()
+        # إغلاق الداتا بيز بنضافة
         db.close()
 
-# السطر ده بيخلي الفنكشن تشتغل أول ما نرن الفايل
 if __name__ == "__main__":
-    read_emg_and_save()
+    record_smart_emg()
