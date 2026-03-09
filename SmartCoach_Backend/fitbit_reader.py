@@ -1,136 +1,128 @@
-# 2. ملف fitbit_reader.py (سحب النبض اللحظي)
-# التعديل الجديد: تم إخفاء الـ CLIENT_ID والـ CLIENT_SECRET في الخزنة السرية (.env) لحماية الأكونت.
+# 2. ملف fitbit_reader.py (القارئ الذكي المتصل بقاعدة البيانات)
+# التعديل الجديد: دعم الـ Multi-User، قراءة التوكن من الداتا بيز بدلاً من الملفات، وتجديد التوكن التلقائي لكل يوزر.
 
 import requests
 import time
-import json
 import os
-from db_manager import DatabaseManager # 🔥 ربطنا الداتا بيز هنا عشان نرمي النبض فيها
-from dotenv import load_dotenv # 🔥 استدعاء مكتبة الخزنة
+from db_manager import DatabaseManager
+from dotenv import load_dotenv
 
-# 1. بنفتح الخزنة السرية
+# 1. بنفتح الخزنة السرية عشان نجيب بيانات الأبلكيشن (مش بيانات اليوزر)
 load_dotenv()
-
-# 2. بيانات الأبلكيشن بتاعك من موقع Fitbit Developer
-# بنسحب الباسوردات السرية من الخزنة بدل ما تكون مكشوفة في الكود
 CLIENT_ID = os.getenv("FITBIT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("FITBIT_CLIENT_SECRET")
 
-# 🔥 خطوة أمان إضافية: بنطمن إن الداتا اتسحبت صح من ملف الـ .env
+# خطوة أمان للتأكد من وجود البيانات
 if not CLIENT_ID or not CLIENT_SECRET:
-    raise ValueError("❌ بيانات Fitbit مش موجودة! اتأكد إنك كاتب FITBIT_CLIENT_ID و FITBIT_CLIENT_SECRET في ملف .env")
+    raise ValueError("❌ بيانات Fitbit مش موجودة في ملف .env")
 
-# الملف ده اللي هنحفظ فيه التوكنز عشان لو قفلنا وشغلنا تاني ميرجعش يطلب صلاحيات من الأول
-TOKEN_FILE = "fitbit_tokens.json"
+# 🔥 تنظيف ذكي (Clean up): 
+# لو لقينا ملف التوكنات القديم اللي كنا بنستخدمه زمان، بنمسحه عشان السيستم يعتمد كلياً على الداتا بيز
+if os.path.exists("fitbit_tokens.json"):
+    os.remove("fitbit_tokens.json")
+    print("🧹 تم مسح ملف التوكنات القديم للاعتماد على قاعدة البيانات.")
 
-# 3. بنفتح اتصال بالداتا بيز
+# بنفتح اتصال بالداتا بيز
 db = DatabaseManager()
 
-# 🔥 التعديل السحري: توحيد الـ Session ID
-# خلينا الـ ID ده نفس اللي الكاميرا بتسجل بيه، عشان النبض والحركة يتسجلوا لنفس الجلسة وفي نفس اللحظة
-session_id = "smartcoach_live_session" 
-
-# 4. الداتا الأولية بتاعتك (التصاريح المبدئية)
-# الـ Access token ده المفتاح المؤقت (بيخلص كل 8 ساعات)
-# الـ Refresh token ده المفتاح الماستر اللي بنجيب بيه access token جديد لو القديم خلص
-INITIAL_TOKENS = {
-    "access_token": "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIyM1RZRDciLCJzdWIiOiJEMzZEVFkiLCJpc3MiOiJGaXRiaXQiLCJ0eXAiOiJhY2Nlc3NfdG9rZW4iLCJzY29wZXMiOiJyc29jIHJlY2cgcnNldCByaXJuIHJveHkgcm51dCBycHJvIHJzbGUgcmNmIHJhY3QgcnJlcyBybG9jIHJ3ZWkgcmhyIHJ0ZW0iLCJleHAiOjE3NzI5NDUzNjgsImlhdCI6MTc3MjkxNjU2OH0.HhJa608c1PX6jD2GAp830kCkQWMCZR1T3Mv0oM65ftY",
-    "refresh_token": "02349f0764756c82a5867028904a80465e3747ea5ae3b8ba8b4fd86aa60120e4"
-}
-
-# الفنكشن دي بتقرأ التوكنز من الملف، ولو الملف مش موجود بتعمله وتحط فيه الداتا الأولية
-def load_tokens():
-    if not os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'w') as f:
-            json.dump(INITIAL_TOKENS, f)
-        return INITIAL_TOKENS
-    with open(TOKEN_FILE, 'r') as f:
-        return json.load(f)
-
-# الفنكشن دي بتحفظ التوكنز الجديدة في الملف بعد ما تتحدث
-def save_tokens(token_data):
-    with open(TOKEN_FILE, 'w') as f:
-        json.dump(token_data, f)
-
-# 5. ذكاء السيستم (Auto-Refresh)
-# الفنكشن دي بتشتغل لوحدها لو السيرفر قالنا إن التوكن خلص (كود 401)
-# بتروح تكلم فيتبيت بالمفتاح الماستر وتجيب مفتاح مؤقت جديد وتكمل شغل من غير ما السيستم يقع
-def refresh_access_token(current_refresh_token):
-    print("🔄 التوكن خلص.. السيستم بيجدده أوتوماتيك دلوقتي!")
+# 🚀 2. الفنكشن اللي بتجدد التوكن وبتحفظه في الداتا بيز للاعب ده بالذات
+def refresh_access_token(player_id, current_refresh_token):
+    print(f"🔄 التوكن خلص للاعب رقم {player_id}.. بنجدده دلوقتي!")
     url = "https://api.fitbit.com/oauth2/token"
-    
     auth = (CLIENT_ID, CLIENT_SECRET)
+    
+    # بنبعت الـ Refresh Token القديم عشان ناخد واحد جديد
     data = {
         "grant_type": "refresh_token",
         "refresh_token": current_refresh_token
     }
     
-    response = requests.post(url, auth=auth, data=data)
-    
-    if response.status_code == 200:
-        new_tokens = response.json()
-        save_tokens(new_tokens) 
-        print("✅ تم تجديد التوكن بنجاح ومكملين شغل!")
-        return new_tokens
-    else:
-        print("❌ فشل تجديد التوكن، الغلطة من فيتبيت:", response.json())
+    try:
+        response = requests.post(url, auth=auth, data=data)
+        
+        if response.status_code == 200:
+            new_tokens = response.json()
+            new_access = new_tokens.get("access_token")
+            new_refresh = new_tokens.get("refresh_token")
+            
+            # 🔥 السحر هنا: بنحفظ التوكن الجديد في الداتا بيز لليوزر ده تحديداً
+            db.update_fitbit_tokens(player_id, new_access, new_refresh)
+            print("✅ تم تجديد التوكن وحفظه في الداتا بيز بنجاح!")
+            return new_access
+        else:
+            print("❌ فشل تجديد التوكن:", response.json())
+            return None
+    except Exception as e:
+        print(f"❌ مشكلة في الاتصال بسيرفرات فيتبيت لتجديد التوكن: {e}")
         return None
 
-# 6. الفنكشن الأساسية اللي بتسحب النبض وتوديه الداتا بيز
+# 🚀 3. الفنكشن الأساسية اللي بتسحب النبض
 def get_heart_rate():
-    tokens = load_tokens()
-    access_token = tokens.get("access_token")
+    # الخطوة الأولى: بنسأل الداتا بيز: "مين اللاعب اللي الجلسة بتاعته شغالة دلوقتي؟"
+    active_session = db.get_active_session_tokens()
     
-    # اللينك ده بيسحب داتا النبض اللحظية (Intraday) بتاعة النهاردة بثانية بثانية
+    # لو مفيش جلسة شغالة، السيستم بينتظر ومبيسحبش حاجة عشان ميعملش ضغط على الـ API
+    if not active_session:
+        print("⏳ مفيش حد بيتمرن دلوقتي.. السيستم في وضع الانتظار.")
+        return
+        
+    session_id = active_session["session_id"]
+    player_id = active_session["player_id"]
+    access_token = active_session["access_token"]
+    refresh_token = active_session["refresh_token"]
+
+    # لو اللاعب مسجلش توكن من الأساس
+    if not access_token:
+        print(f"⚠️ اللاعب رقم {player_id} مش مسجل توكن فيتبيت.")
+        return
+
+    # الخطوة التانية: بنكلم فيتبيت بتوكن اللاعب ده بالتحديد
     url = "https://api.fitbit.com/1/user/-/activities/heart/date/today/1d/1sec.json"
     headers = {"Authorization": f"Bearer {access_token}"}
     
     try:
         response = requests.get(url, headers=headers)
         
-        # لو الرد سليم (200 OK)
+        # لو الطلب نجح والتوكن شغال
         if response.status_code == 200:
             data = response.json()
             try:
-                dataset = data['activities-heart-intraday']['dataset']
+                # بنحاول نوصل لأحدث قراية في الداتا اللي راجعة
+                dataset = data.get('activities-heart-intraday', {}).get('dataset', [])
                 if dataset:
-                    # بنجيب آخر قراية نبض اتسجلت (آخر عنصر في اللستة)
-                    latest_hr = dataset[-1]['value']
-                    latest_time = dataset[-1]['time']
-                    print(f"❤️ أحدث نبض: {latest_hr} bpm (متسجل الساعة: {latest_time})")
+                    latest_hr = dataset[-1]['value'] # بنسحب آخر نبض
+                    print(f"❤️ نبض اللاعب {player_id}: {latest_hr} bpm (Session: {session_id})")
                     
-                    # 🔥 بنبعت النبض ده للداتا بيز الموحدة
-                    # بنحطه في خانة emg_val مؤقتا كطريقة لدمج الفسيولوجي مع الحركي
+                    # 🔥 بنرمي النبض في الداتا بيز تحت الـ Session ID اللي شغالة دلوقتي
                     db.upsert_exercise_data(session_id=session_id, emg_val=float(latest_hr))
-                    
-                    return latest_hr
                 else:
-                    print("⚠️ مفيش داتا نبض متسجلة النهاردة. اتأكد إنك لابس الساعة وعامل Sync.")
-            except KeyError:
-                pass
+                    print(f"⚠️ مفيش داتا نبض متسجلة للاعب {player_id} النهاردة.")
+            except Exception as parse_error:
+                print(f"⚠️ مشكلة في تحليل بيانات النبض: {parse_error}")
                 
         # لو التوكن خلصان (401 Unauthorized)
         elif response.status_code == 401:
-            new_tokens = refresh_access_token(tokens.get("refresh_token"))
-            # لو عرف يجدد التوكن، بيرجع ينده على نفسه تاني عشان يسحب الداتا
-            if new_tokens:
-                return get_heart_rate() 
+            # بننده على دالة التجديد، وبنديها الـ Refresh Token بتاع اللاعب ده
+            new_access = refresh_access_token(player_id, refresh_token)
+            # لو اتجدد بنجاح، بننده على دالة سحب النبض مرة تانية عشان منضيعش القراية
+            if new_access:
+                get_heart_rate() 
         else:
-            print(f"❌ حصل مشكلة في السحب. كود الغلط: {response.status_code}")
+            print(f"❌ مشكلة في السحب. كود الغلط: {response.status_code}")
             
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         print(f"❌ مشكلة في الاتصال بالإنترنت: {e}")
 
-# 7. ده الـ Loop الأساسي اللي بيخلي الفايل يشتغل على طول أول ما تعمله Run
+# 4. الـ Loop الأساسي لتشغيل الفايل
 if __name__ == "__main__":
-    print("🚀 تشغيل سيستم النبض الذكي المستمر...")
+    print("🚀 تشغيل سيستم النبض (Multi-User Mode)...")
     try:
         while True:
             get_heart_rate()
-            time.sleep(5) # بنسحب الداتا كل 5 ثواني عشان مفيش ضغط على API فيتبيت
+            # بنسحب الداتا كل 5 ثواني عشان منعديش الـ Rate Limit بتاع فيتبيت (150 طلب في الساعة)
+            time.sleep(5) 
     except KeyboardInterrupt:
-        # لو قفلنا السكريبت بـ Ctrl+C
         print("\n🛑 بنقفل السيستم...")
     finally:
-        # لازم نقفل الاتصال بالداتا بيز بنضافة عشان السيرفر ميهنجش
+        # تأمين قفل الداتا بيز
         db.close()

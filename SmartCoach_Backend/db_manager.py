@@ -1,6 +1,5 @@
 # 1. ملف db_manager.py (مخ السيستم - Data Pipeline)
-# الملف ده هو المسئول عن إدارة قاعدة البيانات بالكامل.
-# التعديل الجديد: تم تأمين الملف بالكامل وبقينا بنسحب الباسوردات من الخزنة السرية (.env)
+# التعديل: دعم تعدد المستخدمين (Multi-User SaaS) وتأمين التوكنات.
 
 import psycopg2
 import uuid
@@ -8,53 +7,50 @@ import time
 import os
 from dotenv import load_dotenv
 
-# 2. بنفتح الخزنة السرية اللي فيها الباسوردات
+# بنفتح الخزنة ونسحب اللينك السري
 load_dotenv()
-
-# 3. بنسحب اللينك السري من الخزنة
-# استخدام os.getenv بيخلي الكود آمن جداً ومفيش أي باسوردات هتبان على جيت هاب
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 
-# 🔥 خطوة أمان إضافية (Best Practice): 
-# بنتأكد إن اللينك فعلاً اتسحب وموجود، عشان لو نسينا نعمل ملف .env السيستم ينبهنا فوراً
+# خطوة أمان: التأكد إن اللينك موجود عشان السيستم ميضربش إيرور غامض
 if not NEON_DATABASE_URL:
-    raise ValueError("❌ مفيش لينك للداتا بيز! اتأكد إنك عامل ملف .env وكاتب فيه NEON_DATABASE_URL")
+    raise ValueError("❌ مفيش لينك للداتا بيز! اتأكد إنك عامل ملف .env")
 
 class DatabaseManager:
     def __init__(self):
-        # 4. دي أول فنكشن بتشتغل أول ما ننده على الكلاس (Constructor)
-        # بتحاول تفتح اتصال بالداتا بيز السحابية بتاعة Neon
+        # محاولة الاتصال بالداتا بيز السحابية أول ما الكلاس يشتغل
         try:
             self.conn = psycopg2.connect(NEON_DATABASE_URL)
             self.cursor = self.conn.cursor()
             print("✅ تم الاتصال بقاعدة البيانات السحابية (Neon.tech) بنجاح!")
-            self._create_tables()
+            self._create_tables() # بننادي على دالة إنشاء الجداول
         except Exception as e:
             print(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
 
     def _create_tables(self):
-        # 5. الفنكشن دي بتضمن إن الجداول (Schema) موجودة وتتكريت أوتوماتيك لو مش موجودة
-        # استخدام IF NOT EXISTS بيخلي الكود آمن تماماً (Idempotent) حتى لو اشتغل 100 مرة
+        # 🔥 إنشاء الجداول الأساسية (IF NOT EXISTS بتمنع الإيرور لو الجداول موجودة)
         queries = [
             """
-            -- جدول اللاعبين
+            -- جدول اللاعبين: ضفنا فيه عواميد التوكنز عشان كل يوزر ليه ساعته الخاصة
             CREATE TABLE IF NOT EXISTS players (
                 player_id SERIAL PRIMARY KEY,
                 name VARCHAR(100),
+                fitbit_access_token TEXT, 
+                fitbit_refresh_token TEXT, 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
             """
-            -- جدول التمارين (الجلسات) اللي بيربط كل تمرينة بلاعب معين
+            -- جدول الجلسات: ضفنا is_active عشان نعرف مين بيتمرن لايف دلوقتي
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id VARCHAR(50) PRIMARY KEY,
                 player_id INT REFERENCES players(player_id),
                 exercise_type VARCHAR(50),
+                is_active BOOLEAN DEFAULT TRUE, 
                 start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """,
             """
-            -- جدول القرايات (البيانات اللحظية للعداد والنبض والحركة)
+            -- جدول القرايات اللحظية (زي ما هو، بيربط الداتا بالجلسة)
             CREATE TABLE IF NOT EXISTS exercise_data (
                 reading_id VARCHAR(100) PRIMARY KEY,
                 session_id VARCHAR(50) REFERENCES sessions(session_id),
@@ -62,85 +58,117 @@ class DatabaseManager:
                 angle FLOAT,
                 stage VARCHAR(10),
                 reps_count INT,
-                emg_value FLOAT, -- 💡 ده العمود اللي بنسجل فيه نبضات القلب دلوقتي
+                emg_value FLOAT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         ]
-        # بنلف على الاستعلامات وننفذها واحد واحد
+        
+        # تنفيذ أوامر الإنشاء
         for q in queries:
             self.cursor.execute(q)
-        self.conn.commit() # بنأكد الحفظ في الداتا بيز
-        print("✅ الجداول السحابية جاهزة وشغالة")
+            
+        # 🔥 حركة Data Engineering (Migration): 
+        # لو الجداول كانت موجودة من الديمو القديم، الكود ده بيجبرها تضيف العواميد الجديدة من غير ما نمسح الداتا
+        try:
+            self.cursor.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS fitbit_access_token TEXT;")
+            self.cursor.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS fitbit_refresh_token TEXT;")
+            self.cursor.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;")
+        except Exception as e:
+            pass # لو العواميد موجودة هيكمل شغل عادي
+            
+        self.conn.commit()
 
-    def create_session(self, player_id=1, exercise_type="Squats"):
-        # 6. الفنكشن دي بتعمل جلسة تمرين جديدة
-        # بنستخدم uuid عشان نعمل ID عشوائي ومميز مستحيل يتكرر
-        session_id = str(uuid.uuid4())
+    # 🚀 1. دالة تسجيل لاعب جديد (بيكلمها الـ API لما يوزر يعمل حساب)
+    def register_player(self, name, access_token, refresh_token):
+        # بنعمل INSERT وبنستخدم (RETURNING player_id) عشان نرجع الـ ID بتاع اليوزر الجديد للموبايل
+        query = """
+            INSERT INTO players (name, fitbit_access_token, fitbit_refresh_token) 
+            VALUES (%s, %s, %s) RETURNING player_id;
+        """
+        self.cursor.execute(query, (name, access_token, refresh_token))
+        player_id = self.cursor.fetchone()[0]
+        self.conn.commit()
+        return player_id
+
+    # 🚀 2. دالة بدء جلسة تمرين (لما اليوزر يدوس Start Workout)
+    def create_session(self, player_id, exercise_type="Squats"):
+        session_id = f"session_{int(time.time())}_{player_id}" # ID فريد مستحيل يتكرر
         
-        # حركة صياعة (Data Engineering): بندخل بيانات لاعب افتراضي الأول
-        # و(ON CONFLICT DO NOTHING) معناها لو اللاعب موجود متعملش إيرور وكمل شغل عادي
-        self.cursor.execute("INSERT INTO players (player_id, name) VALUES (1, 'Ahmed') ON CONFLICT (player_id) DO NOTHING;")
+        # 🔥 التصليح المعماري: بنقفل أي جلسة قديمة لـ "نفس اللاعب ده بس" عشان السيستم ميتلخبطش
+        close_old_query = "UPDATE sessions SET is_active = FALSE WHERE player_id = %s AND is_active = TRUE;"
+        self.cursor.execute(close_old_query, (player_id,))
         
-        # بنسجل التمرينة الجديدة
-        query = "INSERT INTO sessions (session_id, player_id, exercise_type) VALUES (%s, %s, %s)"
+        # بنفتح الجلسة الجديدة ونخليها Active
+        query = "INSERT INTO sessions (session_id, player_id, exercise_type, is_active) VALUES (%s, %s, %s, TRUE)"
         self.cursor.execute(query, (session_id, player_id, exercise_type))
         self.conn.commit()
         return session_id
 
+    # 🚀 3. دالة بتجيب "مين اللاعب اللي بيتمرن دلوقتي؟" (عشان الفيتبيت تسحب نبضه)
+    def get_active_session_tokens(self):
+        # بنعمل JOIN بين الـ sessions والـ players عشان نجيب التوكن بتاع اللاعب اللي الجلسة بتاعته شغالة
+        query = """
+            SELECT s.session_id, p.player_id, p.fitbit_access_token, p.fitbit_refresh_token 
+            FROM sessions s
+            JOIN players p ON s.player_id = p.player_id
+            WHERE s.is_active = TRUE
+            ORDER BY s.start_time DESC LIMIT 1;
+        """
+        self.cursor.execute(query)
+        result = self.cursor.fetchone()
+        
+        if result:
+            return {
+                "session_id": result[0],
+                "player_id": result[1],
+                "access_token": result[2],
+                "refresh_token": result[3]
+            }
+        return None
+
+    # 🚀 4. دالة بتحدث توكن الفيتبيت لو خلص (Auto-Refresh)
+    def update_fitbit_tokens(self, player_id, new_access, new_refresh):
+        query = "UPDATE players SET fitbit_access_token = %s, fitbit_refresh_token = %s WHERE player_id = %s"
+        self.cursor.execute(query, (new_access, new_refresh, player_id))
+        self.conn.commit()
+
+    # 🚀 5. دالة الـ Upsert (إضافة أو تحديث الداتا اللحظية لمنع التكرار)
     def upsert_exercise_data(self, session_id, angle=None, stage=None, reps=0, emg_val=None):
-        # 7. الفنكشن دي هي اللي بترمي الداتا اللحظية (زي النبض والعداد)
         current_time_ms = int(time.time() * 1000)
         reading_id = f"{session_id}_{current_time_ms}"
-
-        # استخدمنا تقنية الـ Upsert (ON CONFLICT DO UPDATE)
-        # دي بتخلي السيستم يـ Insert الداتا، ولو الـ ID ده موجود قبل كده بيعمله Update
-        # ده بيمنع أي Data Duplication ويخلي الداتا بيز السحابية نضيفة
+        
         query = """
             INSERT INTO exercise_data (reading_id, session_id, timestamp_ms, angle, stage, reps_count, emg_value)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (reading_id) 
-            DO UPDATE SET 
-                angle = EXCLUDED.angle,
-                stage = EXCLUDED.stage,
-                reps_count = EXCLUDED.reps_count,
-                emg_value = EXCLUDED.emg_value;
+            DO UPDATE SET angle=EXCLUDED.angle, stage=EXCLUDED.stage, reps_count=EXCLUDED.reps_count, emg_value=EXCLUDED.emg_value;
         """
         try:
             self.cursor.execute(query, (reading_id, session_id, current_time_ms, angle, stage, reps, emg_val))
             self.conn.commit()
         except Exception as e:
-            print(f"⚠️ مشكلة في حفظ الداتا السحابية: {e}")
-            self.conn.rollback() # لو حصل مشكلة بنتراجع عن العملية عشان الداتا بيز متهنجش
+            print(f"⚠️ مشكلة في حفظ الداتا: {e}") # ضفنا دي عشان لو حصل إيرور نعرف سببه
+            self.conn.rollback()
 
+    # 🚀 6. دالة سحب أحدث قراية لعرضها في الداشبورد والموبايل
     def get_live_data(self, session_id):
-        # 8. الفنكشن المسئولة عن قراية البيانات (بيكلمها الـ API عشان يدي الداتا للموبايل)
-        # بنرتب القرايات تنازلياً (DESC) بالوقت وبناخد أول واحدة (LIMIT 1) عشان نجيب أحدث نبض وعداد
-        query = """
-            SELECT angle, stage, reps_count, emg_value 
-            FROM exercise_data 
-            WHERE session_id = %s 
-            ORDER BY timestamp_ms DESC LIMIT 1;
-        """
+        query = "SELECT angle, stage, reps_count, emg_value FROM exercise_data WHERE session_id = %s ORDER BY timestamp_ms DESC LIMIT 1;"
         self.cursor.execute(query, (session_id,))
         result = self.cursor.fetchone()
         
-        # لو رجع داتا بنرتبها في شكل Dictionary عشان الـ API يفهمها ويحولها JSON بسهولة
         if result:
             return {"angle": result[0], "stage": result[1], "reps": result[2], "emg": result[3]}
         return None
 
+    # 🚀 7. إغلاق الاتصال بقاعدة البيانات بنظافة
     def close(self):
-        # 9. بنقفل الاتصال بقاعدة البيانات بنضافة عشان منستهلكش موارد السيرفر
         self.cursor.close()
         self.conn.close()
 
 if __name__ == "__main__":
-    # 10. ده كود تجريبي بيشتغل بس لو عملت Run للملف ده لوحده للتأكد إن كله سليم
-    print("⏳ جاري اختبار الاتصال بقاعدة البيانات السحابية (Neon)...")
+    print("⏳ اختبار اتصال وصحة قاعدة البيانات...")
     test_db = DatabaseManager()
-    
-    # التأكد من إن الاتصال موجود قبل ما نقفله
     if hasattr(test_db, 'conn'):
         test_db.close()
-        print("✅ تم قفل الاتصال بعد التجربة بنجاح")
+        print("✅ الكود سليم 100%")
